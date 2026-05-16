@@ -1,7 +1,7 @@
 import os
 import json
 import asyncio
-import aiohttp
+import time
 import discord
 from dotenv import load_dotenv
 
@@ -18,47 +18,38 @@ MONITOR_CHANNELS = [
 
 KEYWORDS_FILE = "keywords.json"
 DM_CHANNEL_FILE = "dm_channel.json"
+AVAILABLE_TTL = 3600 * 6  # game stays "available" in status for 6 hours
 
-DISCORD_API = "https://discord.com/api/v10"
 
-
-def load_keywords() -> list[str]:
-    if os.path.exists(KEYWORDS_FILE):
+def load_json(path, default):
+    if os.path.exists(path):
         try:
-            with open(KEYWORDS_FILE, "r") as f:
+            with open(path) as f:
                 return json.load(f)
         except Exception:
             pass
-    return []
+    return default
 
 
-def save_keywords(keywords: list[str]):
-    with open(KEYWORDS_FILE, "w") as f:
-        json.dump(keywords, f, indent=2)
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
 
 
-def load_dm_channel() -> str | None:
-    if os.path.exists(DM_CHANNEL_FILE):
-        try:
-            with open(DM_CHANNEL_FILE, "r") as f:
-                return json.load(f).get("channel_id")
-        except Exception:
-            pass
-    return None
+keywords: list[str] = load_json(KEYWORDS_FILE, [])
+dm_channel_id: str | None = load_json(DM_CHANNEL_FILE, {}).get("channel_id")
+available_games: dict[str, float] = {}  # keyword -> timestamp when last seen
+
+alert_queue: asyncio.Queue = asyncio.Queue()
 
 
-def save_dm_channel(channel_id: str):
-    with open(DM_CHANNEL_FILE, "w") as f:
-        json.dump({"channel_id": channel_id}, f)
+# ──────────────────────────────────────────
+# BOT CLIENT  (bot token — DMs + presence)
+# ──────────────────────────────────────────
 
-
-keywords: list[str] = load_keywords()
-dm_channel_id: str | None = load_dm_channel()
-
-intents = discord.Intents.default()
-intents.message_content = True
-
-client = discord.Client(intents=intents)
+bot_intents = discord.Intents.default()
+bot_intents.message_content = True
+bot_client = discord.Client(intents=bot_intents)
 
 
 async def ensure_dm_channel() -> str | None:
@@ -66,147 +57,169 @@ async def ensure_dm_channel() -> str | None:
     if dm_channel_id:
         return dm_channel_id
 
-    bot_id = str(client.user.id)
+    bot_id = str(bot_client.user.id)
+
+    user_client_ref = discord.Client(intents=discord.Intents.default())
+
+    import aiohttp
     async with aiohttp.ClientSession() as session:
         async with session.post(
-            f"{DISCORD_API}/users/@me/channels",
+            "https://discord.com/api/v10/users/@me/channels",
             headers={"Authorization": USER_TOKEN, "Content-Type": "application/json"},
             json={"recipient_id": bot_id},
         ) as res:
             data = await res.json()
             if res.status == 200 and data.get("id"):
                 dm_channel_id = data["id"]
-                save_dm_channel(dm_channel_id)
-                print(f"DM channel established: {dm_channel_id}")
+                save_json(DM_CHANNEL_FILE, {"channel_id": dm_channel_id})
+                print(f"DM channel ready: {dm_channel_id}")
                 return dm_channel_id
-            else:
-                print(f"Failed to open DM channel: {res.status} {data}")
-                return None
+            print(f"Failed to open DM channel: {res.status} {data}")
+            return None
 
 
-async def send_dm(embed: discord.Embed):
+async def send_bot_dm(embed: discord.Embed):
     channel_id = await ensure_dm_channel()
     if not channel_id:
-        print("Cannot send DM — no channel available.")
         return
+    import aiohttp
+    payload = {
+        "embeds": [{
+            "title": embed.title,
+            "description": embed.description,
+            "color": embed.colour.value if embed.colour else 0x57F287,
+            "fields": [{"name": f.name, "value": f.value, "inline": f.inline} for f in embed.fields],
+        }]
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"https://discord.com/api/v10/channels/{channel_id}/messages",
+            headers={"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"},
+            json=payload,
+        ) as res:
+            if res.status not in (200, 201):
+                data = await res.json()
+                print(f"DM send error: {res.status} {data}")
 
-    channel = client.get_channel(int(channel_id))
-    if channel is None:
-        try:
-            channel = await client.fetch_channel(int(channel_id))
-        except Exception:
-            pass
 
-    if channel:
-        await channel.send(embed=embed)
+async def update_bot_presence():
+    now = time.time()
+    active = {kw: ts for kw, ts in available_games.items() if now - ts < AVAILABLE_TTL}
+    available_games.clear()
+    available_games.update(active)
+
+    if active:
+        names = ", ".join(active.keys())
+        activity = discord.Activity(
+            type=discord.ActivityType.playing,
+            name=f"🟢 {names} — AVAILABLE!",
+        )
+        status = discord.Status.online
+    elif keywords:
+        activity = discord.Activity(
+            type=discord.ActivityType.watching,
+            name=f"{'  |  '.join(keywords[:3])}{'  ...' if len(keywords) > 3 else ''}",
+        )
+        status = discord.Status.idle
     else:
-        async with aiohttp.ClientSession() as session:
-            payload = {
-                "embeds": [
-                    {
-                        "title": embed.title,
-                        "description": embed.description,
-                        "color": embed.colour.value if embed.colour else 0x57F287,
-                        "fields": [{"name": f.name, "value": f.value, "inline": f.inline} for f in embed.fields],
-                    }
-                ]
-            }
-            async with session.post(
-                f"{DISCORD_API}/channels/{channel_id}/messages",
-                headers={"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"},
-                json=payload,
-            ) as res:
-                if res.status not in (200, 201):
-                    data = await res.json()
-                    print(f"Failed to send message: {res.status} {data}")
+        activity = discord.Activity(
+            type=discord.ActivityType.watching,
+            name="for game drops 👀",
+        )
+        status = discord.Status.idle
+
+    await bot_client.change_presence(status=status, activity=activity)
 
 
-@client.event
+async def process_alerts():
+    await bot_client.wait_until_ready()
+    while True:
+        alert = await alert_queue.get()
+        matched: list[str] = alert["matched"]
+        message_data: dict = alert["message"]
+
+        for kw in matched:
+            available_games[kw] = time.time()
+
+        await update_bot_presence()
+
+        embed = discord.Embed(
+            title="🚨 Game Alert — Now Available!",
+            description=message_data["content"][:2000],
+            color=discord.Color.green(),
+            url=message_data["jump_url"],
+        )
+        embed.add_field(name="Keywords", value=", ".join(f"**{kw}**" for kw in matched), inline=False)
+        embed.add_field(name="Server", value=message_data["server"], inline=True)
+        embed.add_field(name="Channel", value=message_data["channel"], inline=True)
+        embed.add_field(name="Posted by", value=message_data["author"], inline=True)
+        embed.add_field(name="Jump Link", value=f"[Go to message]({message_data['jump_url']})", inline=False)
+
+        await send_bot_dm(embed)
+        print(f"Alerted: {matched}")
+
+
+@bot_client.event
 async def on_ready():
-    print(f"Logged in as {client.user} (ID: {client.user.id})")
-    print(f"Monitoring channels: {MONITOR_CHANNELS}")
-    print(f"Loaded keywords: {keywords}")
-
-    channel_id = await ensure_dm_channel()
-    if not channel_id:
-        print("WARNING: Could not establish DM channel.")
-        return
-
-    if keywords:
-        kw_list = "\n".join(f"• {kw}" for kw in keywords)
-        embed = discord.Embed(
-            title="✅ Bot is online!",
-            description=f"Currently watching for:\n{kw_list}\n\nSend me a keyword to add more. Use `!list`, `!remove <keyword>`, or `!clear` to manage them.",
-            color=discord.Color.green(),
-        )
-    else:
-        embed = discord.Embed(
-            title="✅ Bot is online!",
-            description="No keywords set yet. Just send me a word or phrase and I'll watch for it.\n\n**Commands:**\n`!list` — show all keywords\n`!remove <keyword>` — remove one\n`!clear` — remove all",
-            color=discord.Color.green(),
-        )
-
-    await send_dm(embed)
-
-
-@client.event
-async def on_message(message: discord.Message):
-    if message.author == client.user:
-        return
-
-    if isinstance(message.channel, discord.DMChannel) and message.author.id == USER_ID:
-        await handle_dm_command(message)
-        return
-
-    if message.channel.id not in MONITOR_CHANNELS:
-        return
-
-    if not keywords:
-        return
-
-    content_lower = message.content.lower()
-    matched = [kw for kw in keywords if kw.lower() in content_lower]
-
-    if not matched:
-        return
-
-    server_name = message.guild.name if message.guild else "Unknown Server"
-    channel_name = getattr(message.channel, "name", str(message.channel.id))
+    print(f"[BOT] Logged in as {bot_client.user} ({bot_client.user.id})")
+    await ensure_dm_channel()
+    await update_bot_presence()
 
     embed = discord.Embed(
-        title="🚨 Keyword Alert — Game Available!",
-        description=message.content[:2000],
+        title="✅ Bot is online!",
+        description=(
+            f"Monitoring **#{', #'.join(str(c) for c in MONITOR_CHANNELS)}**\n\n"
+            + (
+                "Currently watching for:\n" + "\n".join(f"• {kw}" for kw in keywords)
+                if keywords
+                else "No keywords yet — just DM me any game name to start watching."
+            )
+            + "\n\n**Commands:** `!list` · `!remove <kw>` · `!clear` · `!status`"
+        ),
         color=discord.Color.green(),
-        url=message.jump_url,
     )
-    embed.add_field(name="Matched Keywords", value=", ".join(f"**{kw}**" for kw in matched), inline=False)
-    embed.add_field(name="Server", value=server_name, inline=True)
-    embed.add_field(name="Channel", value=f"#{channel_name}", inline=True)
-    embed.add_field(name="Posted by", value=str(message.author), inline=True)
-    embed.add_field(name="Jump Link", value=f"[Go to message]({message.jump_url})", inline=False)
-
-    if message.attachments:
-        embed.set_image(url=message.attachments[0].url)
-
-    await send_dm(embed)
-    print(f"Alerted for keyword(s): {matched} in #{channel_name}")
+    await send_bot_dm(embed)
 
 
-async def handle_dm_command(message: discord.Message):
+@bot_client.event
+async def on_message(message: discord.Message):
+    if message.author == bot_client.user:
+        return
+    if isinstance(message.channel, discord.DMChannel) and message.author.id == USER_ID:
+        await handle_command(message)
+
+
+async def handle_command(message: discord.Message):
     global keywords
     text = message.content.strip()
 
     if text.lower() == "!list":
         if keywords:
-            kw_list = "\n".join(f"• {kw}" for kw in keywords)
-            await message.channel.send(f"**Watching for ({len(keywords)}):**\n{kw_list}")
+            await message.channel.send("**Watching for:**\n" + "\n".join(f"• {kw}" for kw in keywords))
         else:
-            await message.channel.send("No keywords set. Send me any word or phrase to add it.")
+            await message.channel.send("No keywords set. Send me a game name to add it.")
+        return
+
+    if text.lower() == "!status":
+        now = time.time()
+        lines = []
+        for kw in keywords:
+            ts = available_games.get(kw)
+            if ts and now - ts < AVAILABLE_TTL:
+                mins = int((now - ts) / 60)
+                lines.append(f"🟢 **{kw}** — seen {mins}m ago")
+            else:
+                lines.append(f"🔴 **{kw}** — not seen yet")
+        if lines:
+            await message.channel.send("**Game status:**\n" + "\n".join(lines))
+        else:
+            await message.channel.send("No keywords set.")
         return
 
     if text.lower() == "!clear":
         keywords = []
-        save_keywords(keywords)
+        save_json(KEYWORDS_FILE, keywords)
+        await update_bot_presence()
         await message.channel.send("✅ All keywords cleared.")
         return
 
@@ -215,29 +228,79 @@ async def handle_dm_command(message: discord.Message):
         before = len(keywords)
         keywords = [kw for kw in keywords if kw.lower() != target]
         if len(keywords) < before:
-            save_keywords(keywords)
-            await message.channel.send(f"✅ Removed **{target}** from watchlist.")
+            save_json(KEYWORDS_FILE, keywords)
+            available_games.pop(target, None)
+            await update_bot_presence()
+            await message.channel.send(f"✅ Removed **{target}**.")
         else:
-            await message.channel.send(f"❌ **{target}** wasn't in the watchlist.")
+            await message.channel.send(f"❌ **{target}** not found.")
         return
 
     if text.startswith("!"):
-        await message.channel.send(
-            "Commands:\n`!list` — show all keywords\n`!remove <keyword>` — remove one\n`!clear` — remove all"
-        )
+        await message.channel.send("Commands: `!list` · `!remove <keyword>` · `!clear` · `!status`")
         return
 
-    keyword = text.strip()
-    if keyword.lower() in [kw.lower() for kw in keywords]:
-        await message.channel.send(f"**{keyword}** is already in the watchlist.")
+    kw = text.strip()
+    if kw.lower() in [k.lower() for k in keywords]:
+        await message.channel.send(f"**{kw}** is already in the watchlist.")
         return
 
-    keywords.append(keyword)
-    save_keywords(keywords)
+    keywords.append(kw)
+    save_json(KEYWORDS_FILE, keywords)
+    await update_bot_presence()
     await message.channel.send(
-        f"✅ Added **{keyword}** to watchlist.\n\nNow watching {len(keywords)} keyword(s). Use `!list` to see all."
+        f"✅ Added **{kw}**. Now watching {len(keywords)} keyword(s). Use `!list` to see all."
+    )
+
+
+# ──────────────────────────────────────────
+# USER CLIENT  (user token — reads channels)
+# ──────────────────────────────────────────
+
+user_intents = discord.Intents.default()
+user_intents.message_content = True
+user_client = discord.Client(intents=user_intents)
+
+
+@user_client.event
+async def on_ready():
+    print(f"[USER] Logged in as {user_client.user} — monitoring {len(MONITOR_CHANNELS)} channels")
+
+
+@user_client.event
+async def on_message(message: discord.Message):
+    if message.channel.id not in MONITOR_CHANNELS:
+        return
+    if not keywords:
+        return
+
+    content_lower = message.content.lower()
+    matched = [kw for kw in keywords if kw.lower() in content_lower]
+    if not matched:
+        return
+
+    server = message.guild.name if message.guild else "Unknown"
+    channel = getattr(message.channel, "name", str(message.channel.id))
+
+    await alert_queue.put({
+        "matched": matched,
+        "message": {
+            "content": message.content,
+            "server": server,
+            "channel": f"#{channel}",
+            "author": str(message.author),
+            "jump_url": message.jump_url,
+        },
+    })
+
+
+async def run_all():
+    await asyncio.gather(
+        bot_client.start(BOT_TOKEN),
+        user_client.start(USER_TOKEN, bot=False),
+        process_alerts(),
     )
 
 
 def run_bot():
-    client.run(BOT_TOKEN)
+    asyncio.run(run_all())
