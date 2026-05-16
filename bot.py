@@ -249,8 +249,64 @@ async def handle_command(message: discord.Message):
     save_json(KEYWORDS_FILE, keywords)
     await update_bot_presence()
     await message.channel.send(
-        f"✅ Added **{kw}**. Now watching {len(keywords)} keyword(s). Use `!list` to see all."
+        f"✅ Added **{kw}**. Now watching {len(keywords)} keyword(s). Use `!list` to see all.\n"
+        f"🔍 Scanning recent channel history for **{kw}**..."
     )
+    await check_history_for_keyword(kw)
+
+
+async def check_history_for_keyword(kw: str):
+    """Scan the last 50 messages in each monitored channel for kw right after it's added."""
+    found_any = False
+    for channel_id in MONITOR_CHANNELS:
+        channel = user_client.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await user_client.fetch_channel(channel_id)
+            except Exception as e:
+                print(f"Cannot fetch channel {channel_id}: {e}")
+                continue
+
+        try:
+            async for msg in channel.history(limit=50):
+                if kw.lower() in msg.content.lower():
+                    found_any = True
+                    available_games[kw] = time.time()
+                    await update_bot_presence()
+
+                    server = msg.guild.name if msg.guild else "Unknown"
+                    channel_name = getattr(channel, "name", str(channel_id))
+
+                    embed = discord.Embed(
+                        title="⚠️ Already Available! — Found in Recent History",
+                        description=msg.content[:2000],
+                        color=discord.Color.yellow(),
+                        url=msg.jump_url,
+                    )
+                    embed.add_field(name="Keyword", value=f"**{kw}**", inline=True)
+                    embed.add_field(name="Server", value=server, inline=True)
+                    embed.add_field(name="Channel", value=f"#{channel_name}", inline=True)
+                    embed.add_field(name="Posted by", value=str(msg.author), inline=True)
+                    embed.add_field(name="Posted at", value=f"<t:{int(msg.created_at.timestamp())}:R>", inline=True)
+                    embed.add_field(name="Jump Link", value=f"[Go to message]({msg.jump_url})", inline=False)
+                    embed.set_footer(text="This message was already in the channel before you added the keyword.")
+
+                    await send_bot_dm(embed)
+                    print(f"History match found for '{kw}' in #{channel_name}")
+                    break  # one match per channel is enough
+        except Exception as e:
+            print(f"Error reading history for channel {channel_id}: {e}")
+
+    if not found_any:
+        channel_id = await ensure_dm_channel()
+        if channel_id:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                await session.post(
+                    f"https://discord.com/api/v10/channels/{channel_id}/messages",
+                    headers={"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"},
+                    json={"content": f"🔍 No recent mention of **{kw}** found in the last 50 messages. I'll alert you the moment it appears!"},
+                )
 
 
 # ──────────────────────────────────────────
