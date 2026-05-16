@@ -193,6 +193,37 @@ async def handle_command(message: discord.Message):
     global keywords
     text = message.content.strip()
 
+    if text.lower() in ("!help", "help"):
+        embed = discord.Embed(
+            title="📖 Bot Commands",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(
+            name="Adding & removing keywords",
+            value=(
+                "`<game name>` — Add a keyword to the watchlist. Bot instantly scans the full channel history and DMs you if it's already posted.\n"
+                "`!remove <keyword>` — Stop watching for a specific keyword.\n"
+                "`!clear` — Remove every keyword at once."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Checking status",
+            value=(
+                "`!list` — Show all keywords you're currently watching.\n"
+                "`!status` — Show each keyword with 🟢 (seen recently) or 🔴 (not seen yet)."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="This message",
+            value="`!help` — Show this help card.",
+            inline=False,
+        )
+        embed.set_footer(text="The bot monitors both channels 24/7 and DMs you the moment a keyword appears.")
+        await message.channel.send(embed=embed)
+        return
+
     if text.lower() == "!list":
         if keywords:
             await message.channel.send("**Watching for:**\n" + "\n".join(f"• {kw}" for kw in keywords))
@@ -268,7 +299,7 @@ async def check_history_for_keyword(kw: str):
                 continue
 
         try:
-            async for msg in channel.history(limit=50):
+            async for msg in channel.history(limit=None):
                 if kw.lower() in msg.content.lower():
                     found_any = True
                     available_games[kw] = time.time()
