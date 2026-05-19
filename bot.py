@@ -24,8 +24,8 @@ AVAILABLE_TTL   = 3600 * 6  # 6 hours
 
 DISCORD_API = "https://discord.com/api/v10"
 
-# Intents: DIRECT_MESSAGES (1<<12) | MESSAGE_CONTENT (1<<15)
-BOT_INTENTS = (1 << 12) | (1 << 15)
+# DIRECT_MESSAGES (1<<12). MESSAGE_CONTENT is privileged — not needed for DMs.
+BOT_INTENTS = (1 << 12)
 
 
 def load_json(path, default):
@@ -142,7 +142,11 @@ class BotGateway:
                 async for raw in ws:
                     if raw.type == aiohttp.WSMsgType.TEXT:
                         await self._handle(json.loads(raw.data))
-                    elif raw.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    elif raw.type == aiohttp.WSMsgType.ERROR:
+                        print(f"[BOT GW] WS error: {raw.data}")
+                        break
+                    elif raw.type == aiohttp.WSMsgType.CLOSED:
+                        print(f"[BOT GW] WS closed — code={ws.close_code} extra={ws.exception()}")
                         break
 
     async def _handle(self, msg: dict):
@@ -200,11 +204,26 @@ class BotGateway:
         elif op == 0:  # DISPATCH
             await self._dispatch(evt, data)
 
+    async def _update_presence(self):
+        """Push presence update after gateway is ready."""
+        await self._send({
+            "op": 3,
+            "d": {
+                "since": None,
+                "activities": [{"name": "for game drops 👀", "type": 3}],
+                "status": "online",
+                "afk": False,
+            },
+        })
+
     async def _dispatch(self, evt: str | None, data: dict):
+        print(f"[BOT GW] EVENT: {evt}")
+
         if evt == "READY":
             self._session_id = data["session_id"]
             self._resume_url = data.get("resume_gateway_url", self.GATEWAY)
             print(f"[BOT GW] READY as {data['user']['username']}")
+            await self._update_presence()
             if not self._welcomed:
                 self._welcomed = True
                 await asyncio.sleep(1)
@@ -220,13 +239,17 @@ class BotGateway:
                 )
 
         elif evt == "MESSAGE_CREATE":
-            ch_id = int(data.get("channel_id", 0))
             author_id = int(data["author"]["id"])
+            guild_id  = data.get("guild_id")
+            content   = data.get("content", "")
+            print(f"[BOT GW] MESSAGE guild={guild_id} author={author_id} content={content!r}")
             # DM from the user → treat as command
-            if data.get("guild_id") is None and author_id == USER_ID:
-                content = data["content"].strip()
+            if guild_id is None and author_id == USER_ID:
                 print(f"[CMD] {content!r}")
-                asyncio.create_task(handle_command(content))
+                try:
+                    asyncio.create_task(handle_command(content.strip()))
+                except Exception as exc:
+                    print(f"[CMD] Error: {exc}")
 
         elif evt == "RESUMED":
             print("[BOT GW] Session resumed")
