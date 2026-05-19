@@ -23,9 +23,11 @@ DM_CHANNEL_FILE = "dm_channel.json"
 AVAILABLE_TTL   = 3600 * 6  # 6 hours
 
 DISCORD_API = "https://discord.com/api/v10"
-
-# DIRECT_MESSAGES (1<<12). MESSAGE_CONTENT is privileged — not needed for DMs.
+# DIRECT_MESSAGES (1<<12). MESSAGE_CONTENT privileged not needed for DMs.
 BOT_INTENTS = (1 << 12)
+
+# Global gateway reference so command handlers can push presence updates
+bot_gw: "BotGateway | None" = None
 
 
 def load_json(path, default):
@@ -43,13 +45,79 @@ def save_json(path, data):
         json.dump(data, f, indent=2)
 
 
-keywords: list[str]         = load_json(KEYWORDS_FILE, [])
-dm_channel_id: str | None   = load_json(DM_CHANNEL_FILE, {}).get("channel_id")
+keywords: list[str]               = load_json(KEYWORDS_FILE, [])
+dm_channel_id: str | None         = load_json(DM_CHANNEL_FILE, {}).get("channel_id")
 available_games: dict[str, float] = {}
 
 
 # ─────────────────────────────────────────────
-# REST helpers — all messages go via aiohttp
+# Embed text extractor
+# Channel posts are Discord embeds with empty content — read all embed fields
+# ─────────────────────────────────────────────
+
+def extract_text(message: discord.Message) -> str:
+    """Return all searchable text from a message including embed titles/descriptions/fields."""
+    parts: list[str] = []
+    if message.content:
+        parts.append(message.content)
+    for embed in message.embeds:
+        if embed.title:
+            parts.append(embed.title)
+        if embed.description:
+            parts.append(embed.description)
+        if embed.author and embed.author.name:
+            parts.append(embed.author.name)
+        for field in embed.fields:
+            if field.name:
+                parts.append(field.name)
+            if field.value:
+                parts.append(field.value)
+        if embed.footer and embed.footer.text:
+            parts.append(embed.footer.text)
+    return " ".join(parts)
+
+
+def extract_text_from_data(data: dict) -> str:
+    """Same as extract_text but works on raw message dict (REST API response)."""
+    parts: list[str] = []
+    if data.get("content"):
+        parts.append(data["content"])
+    for embed in data.get("embeds", []):
+        if embed.get("title"):
+            parts.append(embed["title"])
+        if embed.get("description"):
+            parts.append(embed["description"])
+        if embed.get("author", {}).get("name"):
+            parts.append(embed["author"]["name"])
+        for field in embed.get("fields", []):
+            if field.get("name"):
+                parts.append(field["name"])
+            if field.get("value"):
+                parts.append(field["value"])
+        if embed.get("footer", {}).get("text"):
+            parts.append(embed["footer"]["text"])
+    return " ".join(parts)
+
+
+def message_summary(message: discord.Message) -> str:
+    """One-line human-readable summary of a message for the alert embed."""
+    if message.content:
+        return message.content[:2000]
+    for embed in message.embeds:
+        lines = []
+        if embed.title:
+            lines.append(f"**{embed.title}**")
+        if embed.description:
+            lines.append(embed.description[:500])
+        for field in embed.fields:
+            lines.append(f"**{field.name}:** {field.value}")
+        if lines:
+            return "\n".join(lines)[:2000]
+    return "(no text content)"
+
+
+# ─────────────────────────────────────────────
+# REST helpers
 # ─────────────────────────────────────────────
 
 async def ensure_dm_channel() -> str | None:
@@ -86,10 +154,6 @@ async def bot_send(payload: dict):
                 print(f"[REST] Send error: {res.status} {await res.json()}")
 
 
-async def send_text(text: str):
-    await bot_send({"content": text})
-
-
 async def send_embed(
     title: str,
     description: str,
@@ -109,6 +173,32 @@ async def send_embed(
 
 
 # ─────────────────────────────────────────────
+# Presence helpers
+# ─────────────────────────────────────────────
+
+def _build_presence(status: str = "online", activity_name: str | None = None, activity_type: int = 3) -> dict:
+    if activity_name is None:
+        if keywords:
+            activity_name = " | ".join(keywords[:3]) + (" ..." if len(keywords) > 3 else "")
+        else:
+            activity_name = "for game drops 👀"
+    return {
+        "op": 3,
+        "d": {
+            "since": None,
+            "activities": [{"name": activity_name, "type": activity_type}],
+            "status": status,
+            "afk": False,
+        },
+    }
+
+
+async def push_presence(status: str = "online", activity_name: str | None = None, activity_type: int = 3):
+    if bot_gw:
+        await bot_gw._send(_build_presence(status, activity_name, activity_type))
+
+
+# ─────────────────────────────────────────────
 # BOT GATEWAY  (raw WebSocket, bot token)
 # Makes bot show online + handles DM commands
 # ─────────────────────────────────────────────
@@ -125,12 +215,11 @@ class BotGateway:
         self._welcomed = False
 
     async def run(self):
-        """Keep the bot gateway alive forever."""
         while True:
             try:
                 await self._connect()
             except Exception as exc:
-                print(f"[BOT GW] Disconnected: {exc}  — reconnecting in 5s")
+                print(f"[BOT GW] Disconnected: {exc} — reconnecting in 5s")
             await asyncio.sleep(5)
 
     async def _connect(self):
@@ -146,7 +235,7 @@ class BotGateway:
                         print(f"[BOT GW] WS error: {raw.data}")
                         break
                     elif raw.type == aiohttp.WSMsgType.CLOSED:
-                        print(f"[BOT GW] WS closed — code={ws.close_code} extra={ws.exception()}")
+                        print(f"[BOT GW] WS closed — code={ws.close_code}")
                         break
 
     async def _handle(self, msg: dict):
@@ -163,31 +252,25 @@ class BotGateway:
             if self._heartbeat_task:
                 self._heartbeat_task.cancel()
             self._heartbeat_task = asyncio.create_task(self._heartbeat(interval))
-
             if self._session_id and self._sequence:
-                await self._send({"op": 6, "d": {  # RESUME
+                await self._send({"op": 6, "d": {
                     "token": BOT_TOKEN,
                     "session_id": self._session_id,
                     "seq": self._sequence,
                 }})
-                print("[BOT GW] Resuming session")
             else:
-                await self._send({"op": 2, "d": {  # IDENTIFY
+                await self._send({"op": 2, "d": {
                     "token": BOT_TOKEN,
                     "intents": BOT_INTENTS,
                     "properties": {"os": "linux", "browser": "disco", "device": "disco"},
-                    "presence": {
-                        "status": "online",
-                        "activities": [{"name": "for game drops 👀", "type": 3}],
-                        "afk": False,
-                    },
+                    "presence": _build_presence()["d"],
                 }})
                 print("[BOT GW] Sent IDENTIFY")
 
-        elif op == 11:  # HEARTBEAT ACK
-            pass
+        elif op == 11:
+            pass  # HEARTBEAT ACK
 
-        elif op == 1:  # HEARTBEAT request
+        elif op == 1:
             await self._send({"op": 1, "d": self._sequence})
 
         elif op == 9:  # INVALID SESSION
@@ -201,53 +284,38 @@ class BotGateway:
                 "properties": {"os": "linux", "browser": "disco", "device": "disco"},
             }})
 
-        elif op == 0:  # DISPATCH
+        elif op == 0:
             await self._dispatch(evt, data)
 
-    async def _update_presence(self):
-        """Push presence update after gateway is ready."""
-        await self._send({
-            "op": 3,
-            "d": {
-                "since": None,
-                "activities": [{"name": "for game drops 👀", "type": 3}],
-                "status": "online",
-                "afk": False,
-            },
-        })
-
     async def _dispatch(self, evt: str | None, data: dict):
-        print(f"[BOT GW] EVENT: {evt}")
-
         if evt == "READY":
             self._session_id = data["session_id"]
             self._resume_url = data.get("resume_gateway_url", self.GATEWAY)
             print(f"[BOT GW] READY as {data['user']['username']}")
-            await self._update_presence()
+            await push_presence()
             if not self._welcomed:
                 self._welcomed = True
                 await asyncio.sleep(1)
                 kw_text = (
-                    "Currently watching for:\n" + "\n".join(f"• {kw}" for kw in keywords)
+                    "\n".join(f"• {kw}" for kw in keywords)
                     if keywords
                     else "No keywords yet — DM me any game name to start watching."
                 )
                 await send_embed(
                     title="✅ Bot is online!",
-                    description=f"{kw_text}\n\n**Commands:** `!list` · `!status` · `!remove <kw>` · `!clear` · `!help`",
+                    description=f"**Watching for:**\n{kw_text}\n\n**Commands:** `!list` · `!status` · `!remove <kw>` · `!clear` · `!help`",
                     color=0x57F287,
                 )
 
         elif evt == "MESSAGE_CREATE":
             author_id = int(data["author"]["id"])
             guild_id  = data.get("guild_id")
-            content   = data.get("content", "")
-            print(f"[BOT GW] MESSAGE guild={guild_id} author={author_id} content={content!r}")
-            # DM from the user → treat as command
+            content   = data.get("content", "").strip()
+            # DM from the owner → treat as command
             if guild_id is None and author_id == USER_ID:
                 print(f"[CMD] {content!r}")
                 try:
-                    asyncio.create_task(handle_command(content.strip()))
+                    asyncio.create_task(handle_command(content))
                 except Exception as exc:
                     print(f"[CMD] Error: {exc}")
 
@@ -255,7 +323,8 @@ class BotGateway:
             print("[BOT GW] Session resumed")
 
     async def _heartbeat(self, interval: float):
-        await asyncio.sleep(interval * (0.5 + 0.5 * __import__("random").random()))
+        import random
+        await asyncio.sleep(interval * (0.5 + 0.5 * random.random()))
         while True:
             await self._send({"op": 1, "d": self._sequence})
             await asyncio.sleep(interval)
@@ -267,7 +336,7 @@ class BotGateway:
 
 # ─────────────────────────────────────────────
 # USER CLIENT  (discord.py-self, user token)
-# Monitors the game channels for keywords
+# Monitors game channels for keywords
 # ─────────────────────────────────────────────
 
 client = discord.Client()
@@ -286,24 +355,30 @@ async def on_message(message: discord.Message):
     if not keywords:
         return
 
-    content_lower = message.content.lower()
-    matched = [kw for kw in keywords if kw.lower() in content_lower]
+    full_text = extract_text(message).lower()
+    matched = [kw for kw in keywords if kw.lower() in full_text]
     if not matched:
         return
 
     for kw in matched:
         available_games[kw] = time.time()
 
+    # Update presence to show the alert
+    active_names = ", ".join(f"🟢 {kw.upper()}" for kw in matched)
+    await push_presence(status="online", activity_name=f"{active_names} — AVAILABLE!", activity_type=0)
+
     server  = message.guild.name if message.guild else "Unknown"
     ch_name = getattr(message.channel, "name", str(message.channel.id))
+    summary = message_summary(message)
+
     await send_embed(
         title="🚨 Game Alert — Now Available!",
-        description=message.content[:2000],
+        description=summary,
         color=0x57F287,
         fields=[
             {"name": "Keywords",  "value": ", ".join(f"**{kw}**" for kw in matched), "inline": False},
-            {"name": "Server",    "value": server,          "inline": True},
-            {"name": "Channel",   "value": f"#{ch_name}",   "inline": True},
+            {"name": "Server",    "value": server,              "inline": True},
+            {"name": "Channel",   "value": f"#{ch_name}",       "inline": True},
             {"name": "Posted by", "value": str(message.author), "inline": True},
             {"name": "Jump Link", "value": f"[Go to message]({message.jump_url})", "inline": False},
         ],
@@ -319,30 +394,41 @@ async def on_message(message: discord.Message):
 async def handle_command(text: str):
     global keywords
 
+    if not text:
+        return
+
     if text.lower() in ("!help", "help"):
         await send_embed(
             title="📖 Bot Commands",
             description=(
                 "**Adding & removing keywords**\n"
-                "`<game name>` — Add a keyword. Bot instantly scans the full channel history.\n"
+                "`<game name>` — Add a keyword. Bot instantly scans the full channel history (including embeds).\n"
                 "`!remove <keyword>` — Stop watching for a keyword.\n"
                 "`!clear` — Remove all keywords.\n\n"
                 "**Checking status**\n"
                 "`!list` — Show all keywords you're watching.\n"
-                "`!status` — Show 🟢/🔴 for each keyword.\n\n"
-                "**This message**\n"
-                "`!help` — Show this help card."
+                "`!status` — Show 🟢/🔴 availability for each keyword.\n\n"
+                "**Help**\n"
+                "`!help` — Show this card."
             ),
             color=0x5865F2,
-            footer="The bot monitors your channels 24/7 and DMs you the moment a keyword appears.",
+            footer="The bot monitors your channels 24/7 and reads both text and embed messages.",
         )
         return
 
     if text.lower() == "!list":
         if keywords:
-            await send_text("**Watching for:**\n" + "\n".join(f"• {kw}" for kw in keywords))
+            await send_embed(
+                title="👀 Watchlist",
+                description="\n".join(f"• {kw}" for kw in keywords),
+                color=0x5865F2,
+            )
         else:
-            await send_text("No keywords set. Send me a game name to add it.")
+            await send_embed(
+                title="👀 Watchlist",
+                description="No keywords set yet. Send me a game name to start watching.",
+                color=0x5865F2,
+            )
         return
 
     if text.lower() == "!status":
@@ -355,45 +441,87 @@ async def handle_command(text: str):
                 lines.append(f"🟢 **{kw}** — seen {mins}m ago")
             else:
                 lines.append(f"🔴 **{kw}** — not seen yet")
-        await send_text("**Game status:**\n" + "\n".join(lines) if lines else "No keywords set.")
+        await send_embed(
+            title="📊 Game Status",
+            description="\n".join(lines) if lines else "No keywords set.",
+            color=0x5865F2,
+        )
         return
 
     if text.lower() == "!clear":
+        count = len(keywords)
         keywords = []
         save_json(KEYWORDS_FILE, keywords)
-        await send_text("✅ All keywords cleared.")
+        available_games.clear()
+        await push_presence()
+        await send_embed(
+            title="🗑️ Watchlist Cleared",
+            description=f"Removed all {count} keyword(s).",
+            color=0xED4245,
+        )
         return
 
     if text.lower().startswith("!remove "):
-        target = text[8:].strip().lower()
+        target = text[8:].strip()
         before = len(keywords)
-        keywords = [kw for kw in keywords if kw.lower() != target]
+        keywords = [kw for kw in keywords if kw.lower() != target.lower()]
         if len(keywords) < before:
             save_json(KEYWORDS_FILE, keywords)
-            available_games.pop(target, None)
-            await send_text(f"✅ Removed **{target}**.")
+            available_games.pop(target.lower(), None)
+            await push_presence()
+            await send_embed(
+                title="✅ Keyword Removed",
+                description=f"**{target}** has been removed from the watchlist.",
+                color=0x57F287,
+            )
         else:
-            await send_text(f"❌ **{target}** not in the watchlist.")
+            await send_embed(
+                title="❌ Not Found",
+                description=f"**{target}** is not in the watchlist.",
+                color=0xED4245,
+            )
         return
 
     if text.startswith("!"):
-        await send_text("Commands: `!list` · `!status` · `!remove <keyword>` · `!clear` · `!help`")
+        await send_embed(
+            title="❓ Unknown Command",
+            description="Commands: `!list` · `!status` · `!remove <keyword>` · `!clear` · `!help`",
+            color=0xED4245,
+        )
         return
 
-    # Plain text → add as keyword
+    # Plain text = add as keyword
     kw = text
     if kw.lower() in [k.lower() for k in keywords]:
-        await send_text(f"**{kw}** is already in the watchlist.")
+        await send_embed(
+            title="ℹ️ Already Watching",
+            description=f"**{kw}** is already in the watchlist.",
+            color=0x5865F2,
+        )
         return
 
     keywords.append(kw)
     save_json(KEYWORDS_FILE, keywords)
-    await send_text(
-        f"✅ Added **{kw}**. Watching {len(keywords)} keyword(s).\n"
-        f"🔍 Scanning the full channel history for **{kw}**..."
+
+    # Update presence to show the new keyword list
+    kw_list = " | ".join(keywords[:3]) + (" ..." if len(keywords) > 3 else "")
+    await push_presence(activity_name=kw_list)
+
+    await send_embed(
+        title="✅ Keyword Added",
+        description=(
+            f"Now watching for **{kw}**.\n"
+            f"Total: **{len(keywords)}** keyword(s)\n\n"
+            f"🔍 Scanning full channel history (including embeds)..."
+        ),
+        color=0x57F287,
     )
     asyncio.create_task(check_history_for_keyword(kw))
 
+
+# ─────────────────────────────────────────────
+# History scan — reads both text and embed content
+# ─────────────────────────────────────────────
 
 async def check_history_for_keyword(kw: str):
     found_any = False
@@ -408,15 +536,23 @@ async def check_history_for_keyword(kw: str):
 
         try:
             async for msg in channel.history(limit=None):
-                if kw.lower() in msg.content.lower():
+                full_text = extract_text(msg).lower()
+                if kw.lower() in full_text:
                     found_any = True
                     available_games[kw] = time.time()
 
                     server  = msg.guild.name if msg.guild else "Unknown"
                     ch_name = getattr(channel, "name", str(channel_id))
+                    summary = message_summary(msg)
+
+                    await push_presence(
+                        status="online",
+                        activity_name=f"🟢 {kw.upper()} — FOUND IN HISTORY",
+                        activity_type=0,
+                    )
                     await send_embed(
                         title="⚠️ Already Available! — Found in Channel History",
-                        description=msg.content[:2000],
+                        description=summary,
                         color=0xFEE75C,
                         fields=[
                             {"name": "Keyword",   "value": f"**{kw}**",  "inline": True},
@@ -429,14 +565,16 @@ async def check_history_for_keyword(kw: str):
                         footer="This message was already in the channel before you added the keyword.",
                         url=msg.jump_url,
                     )
-                    print(f"[HISTORY] '{kw}' in #{ch_name}")
+                    print(f"[HISTORY] '{kw}' found in #{ch_name}")
                     break
         except Exception as e:
             print(f"Error reading history for {channel_id}: {e}")
 
     if not found_any:
-        await send_text(
-            f"🔍 No mention of **{kw}** found in the full channel history. I'll alert you the moment it appears!"
+        await send_embed(
+            title="🔍 History Scan Complete",
+            description=f"No mention of **{kw}** found in the full channel history.\nYou'll be alerted the moment it appears!",
+            color=0x5865F2,
         )
 
 
@@ -445,6 +583,7 @@ async def check_history_for_keyword(kw: str):
 # ─────────────────────────────────────────────
 
 def run_bot():
+    global bot_gw
     bot_gw = BotGateway()
 
     async def _main():
