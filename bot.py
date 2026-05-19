@@ -359,7 +359,7 @@ async def on_message(message: discord.Message):
 async def run_all():
     await asyncio.gather(
         bot_client.start(BOT_TOKEN),
-        user_client.start(USER_TOKEN, bot=False),
+        user_client.start(USER_TOKEN),
         process_alerts(),
     )
 
