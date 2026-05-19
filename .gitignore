@@ -1,0 +1,6 @@
+.env
+keywords.json
+dm_channel.json
+__pycache__/
+*.pyc
+*.pyo
