@@ -8,21 +8,24 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
+BOT_TOKEN  = os.environ["DISCORD_BOT_TOKEN"]
 USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
-USER_ID = int(os.environ["DISCORD_USER_ID"])
-BOT_ID = 1505161323091198094
+USER_ID    = int(os.environ["DISCORD_USER_ID"])
+BOT_ID     = 1505161323091198094
 MONITOR_CHANNELS = [
     int(c.strip())
     for c in os.environ.get("MONITOR_CHANNELS", "1276133271322886270,1276133271322886271").split(",")
     if c.strip()
 ]
 
-KEYWORDS_FILE = "keywords.json"
+KEYWORDS_FILE   = "keywords.json"
 DM_CHANNEL_FILE = "dm_channel.json"
-AVAILABLE_TTL = 3600 * 6  # 6 hours
+AVAILABLE_TTL   = 3600 * 6  # 6 hours
 
 DISCORD_API = "https://discord.com/api/v10"
+
+# Intents: DIRECT_MESSAGES (1<<12) | MESSAGE_CONTENT (1<<15)
+BOT_INTENTS = (1 << 12) | (1 << 15)
 
 
 def load_json(path, default):
@@ -40,13 +43,13 @@ def save_json(path, data):
         json.dump(data, f, indent=2)
 
 
-keywords: list[str] = load_json(KEYWORDS_FILE, [])
-dm_channel_id: str | None = load_json(DM_CHANNEL_FILE, {}).get("channel_id")
+keywords: list[str]         = load_json(KEYWORDS_FILE, [])
+dm_channel_id: str | None   = load_json(DM_CHANNEL_FILE, {}).get("channel_id")
 available_games: dict[str, float] = {}
 
 
 # ─────────────────────────────────────────────
-# REST helpers — all bot actions go via aiohttp
+# REST helpers — all messages go via aiohttp
 # ─────────────────────────────────────────────
 
 async def ensure_dm_channel() -> str | None:
@@ -63,14 +66,13 @@ async def ensure_dm_channel() -> str | None:
             if res.status == 200 and data.get("id"):
                 dm_channel_id = data["id"]
                 save_json(DM_CHANNEL_FILE, {"channel_id": dm_channel_id})
-                print(f"DM channel ready: {dm_channel_id}")
+                print(f"[REST] DM channel ready: {dm_channel_id}")
                 return dm_channel_id
-            print(f"DM channel error: {res.status} {data}")
+            print(f"[REST] DM channel error: {res.status} {data}")
             return None
 
 
 async def bot_send(payload: dict):
-    """Send a message to the DM channel using the bot token."""
     channel_id = await ensure_dm_channel()
     if not channel_id:
         return
@@ -81,7 +83,7 @@ async def bot_send(payload: dict):
             json=payload,
         ) as res:
             if res.status not in (200, 201):
-                print(f"Send error: {res.status} {await res.json()}")
+                print(f"[REST] Send error: {res.status} {await res.json()}")
 
 
 async def send_text(text: str):
@@ -106,65 +108,156 @@ async def send_embed(
     await bot_send({"embeds": [embed]})
 
 
-async def update_presence():
-    """Update the bot's Discord status via REST gateway (best-effort)."""
-    now = time.time()
-    for kw in list(available_games):
-        if now - available_games[kw] >= AVAILABLE_TTL:
-            available_games.pop(kw)
+# ─────────────────────────────────────────────
+# BOT GATEWAY  (raw WebSocket, bot token)
+# Makes bot show online + handles DM commands
+# ─────────────────────────────────────────────
 
-    active = list(available_games.keys())
-    if active:
-        name = f"🟢 {', '.join(active)} — AVAILABLE!"
-        atype = 0  # Playing
-        status = "online"
-    elif keywords:
-        name = "  |  ".join(keywords[:3]) + ("  ..." if len(keywords) > 3 else "")
-        atype = 3  # Watching
-        status = "idle"
-    else:
-        name = "for game drops 👀"
-        atype = 3
-        status = "idle"
+class BotGateway:
+    GATEWAY = "wss://gateway.discord.gg/?v=10&encoding=json"
 
-    # Update via bot REST — presence updates require gateway but we can
-    # set the bot's activity by patching the application if needed.
-    # For now log it; gateway-based presence is set on connect in on_ready via user client.
-    print(f"[Presence] {status}: {name}")
+    def __init__(self):
+        self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self._heartbeat_task: asyncio.Task | None = None
+        self._sequence: int | None = None
+        self._session_id: str | None = None
+        self._resume_url: str | None = None
+        self._welcomed = False
+
+    async def run(self):
+        """Keep the bot gateway alive forever."""
+        while True:
+            try:
+                await self._connect()
+            except Exception as exc:
+                print(f"[BOT GW] Disconnected: {exc}  — reconnecting in 5s")
+            await asyncio.sleep(5)
+
+    async def _connect(self):
+        url = self._resume_url or self.GATEWAY
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(url) as ws:
+                self._ws = ws
+                print(f"[BOT GW] Connected to {url}")
+                async for raw in ws:
+                    if raw.type == aiohttp.WSMsgType.TEXT:
+                        await self._handle(json.loads(raw.data))
+                    elif raw.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+
+    async def _handle(self, msg: dict):
+        op   = msg["op"]
+        data = msg.get("d")
+        seq  = msg.get("s")
+        evt  = msg.get("t")
+
+        if seq is not None:
+            self._sequence = seq
+
+        if op == 10:  # HELLO
+            interval = data["heartbeat_interval"] / 1000
+            if self._heartbeat_task:
+                self._heartbeat_task.cancel()
+            self._heartbeat_task = asyncio.create_task(self._heartbeat(interval))
+
+            if self._session_id and self._sequence:
+                await self._send({"op": 6, "d": {  # RESUME
+                    "token": BOT_TOKEN,
+                    "session_id": self._session_id,
+                    "seq": self._sequence,
+                }})
+                print("[BOT GW] Resuming session")
+            else:
+                await self._send({"op": 2, "d": {  # IDENTIFY
+                    "token": BOT_TOKEN,
+                    "intents": BOT_INTENTS,
+                    "properties": {"os": "linux", "browser": "disco", "device": "disco"},
+                    "presence": {
+                        "status": "online",
+                        "activities": [{"name": "for game drops 👀", "type": 3}],
+                        "afk": False,
+                    },
+                }})
+                print("[BOT GW] Sent IDENTIFY")
+
+        elif op == 11:  # HEARTBEAT ACK
+            pass
+
+        elif op == 1:  # HEARTBEAT request
+            await self._send({"op": 1, "d": self._sequence})
+
+        elif op == 9:  # INVALID SESSION
+            print("[BOT GW] Invalid session — re-identifying")
+            self._session_id = None
+            self._resume_url = None
+            await asyncio.sleep(2)
+            await self._send({"op": 2, "d": {
+                "token": BOT_TOKEN,
+                "intents": BOT_INTENTS,
+                "properties": {"os": "linux", "browser": "disco", "device": "disco"},
+            }})
+
+        elif op == 0:  # DISPATCH
+            await self._dispatch(evt, data)
+
+    async def _dispatch(self, evt: str | None, data: dict):
+        if evt == "READY":
+            self._session_id = data["session_id"]
+            self._resume_url = data.get("resume_gateway_url", self.GATEWAY)
+            print(f"[BOT GW] READY as {data['user']['username']}")
+            if not self._welcomed:
+                self._welcomed = True
+                await asyncio.sleep(1)
+                kw_text = (
+                    "Currently watching for:\n" + "\n".join(f"• {kw}" for kw in keywords)
+                    if keywords
+                    else "No keywords yet — DM me any game name to start watching."
+                )
+                await send_embed(
+                    title="✅ Bot is online!",
+                    description=f"{kw_text}\n\n**Commands:** `!list` · `!status` · `!remove <kw>` · `!clear` · `!help`",
+                    color=0x57F287,
+                )
+
+        elif evt == "MESSAGE_CREATE":
+            ch_id = int(data.get("channel_id", 0))
+            author_id = int(data["author"]["id"])
+            # DM from the user → treat as command
+            if data.get("guild_id") is None and author_id == USER_ID:
+                content = data["content"].strip()
+                print(f"[CMD] {content!r}")
+                asyncio.create_task(handle_command(content))
+
+        elif evt == "RESUMED":
+            print("[BOT GW] Session resumed")
+
+    async def _heartbeat(self, interval: float):
+        await asyncio.sleep(interval * (0.5 + 0.5 * __import__("random").random()))
+        while True:
+            await self._send({"op": 1, "d": self._sequence})
+            await asyncio.sleep(interval)
+
+    async def _send(self, payload: dict):
+        if self._ws and not self._ws.closed:
+            await self._ws.send_str(json.dumps(payload))
 
 
 # ─────────────────────────────────────────────
 # USER CLIENT  (discord.py-self, user token)
-# Does: channel monitoring + command handling
+# Monitors the game channels for keywords
 # ─────────────────────────────────────────────
 
 client = discord.Client()
-_welcomed = False
 
 
 @client.event
 async def on_ready():
-    global _welcomed
-    print(f"[CLIENT] Logged in as {client.user}")
+    print(f"[USER CLIENT] Logged in as {client.user}")
     await ensure_dm_channel()
-
-    if not _welcomed:
-        _welcomed = True
-        kw_text = (
-            "Currently watching for:\n" + "\n".join(f"• {kw}" for kw in keywords)
-            if keywords
-            else "No keywords yet — DM me any game name to start watching."
-        )
-        await send_embed(
-            title="✅ Bot is online!",
-            description=f"{kw_text}\n\n**Commands:** `!list` · `!status` · `!remove <kw>` · `!clear` · `!help`",
-            color=0x57F287,
-        )
 
 
 @client.event
 async def on_message(message: discord.Message):
-    # Alert: message in a monitored channel
     if message.channel.id not in MONITOR_CHANNELS:
         return
     if not keywords:
@@ -177,24 +270,23 @@ async def on_message(message: discord.Message):
 
     for kw in matched:
         available_games[kw] = time.time()
-    await update_presence()
 
-    server = message.guild.name if message.guild else "Unknown"
+    server  = message.guild.name if message.guild else "Unknown"
     ch_name = getattr(message.channel, "name", str(message.channel.id))
     await send_embed(
         title="🚨 Game Alert — Now Available!",
         description=message.content[:2000],
         color=0x57F287,
         fields=[
-            {"name": "Keywords", "value": ", ".join(f"**{kw}**" for kw in matched), "inline": False},
-            {"name": "Server", "value": server, "inline": True},
-            {"name": "Channel", "value": f"#{ch_name}", "inline": True},
+            {"name": "Keywords",  "value": ", ".join(f"**{kw}**" for kw in matched), "inline": False},
+            {"name": "Server",    "value": server,          "inline": True},
+            {"name": "Channel",   "value": f"#{ch_name}",   "inline": True},
             {"name": "Posted by", "value": str(message.author), "inline": True},
             {"name": "Jump Link", "value": f"[Go to message]({message.jump_url})", "inline": False},
         ],
         url=message.jump_url,
     )
-    print(f"Alert sent: {matched} in #{ch_name}")
+    print(f"[ALERT] {matched} in #{ch_name}")
 
 
 # ─────────────────────────────────────────────
@@ -246,7 +338,6 @@ async def handle_command(text: str):
     if text.lower() == "!clear":
         keywords = []
         save_json(KEYWORDS_FILE, keywords)
-        await update_presence()
         await send_text("✅ All keywords cleared.")
         return
 
@@ -257,7 +348,6 @@ async def handle_command(text: str):
         if len(keywords) < before:
             save_json(KEYWORDS_FILE, keywords)
             available_games.pop(target, None)
-            await update_presence()
             await send_text(f"✅ Removed **{target}**.")
         else:
             await send_text(f"❌ **{target}** not in the watchlist.")
@@ -267,6 +357,7 @@ async def handle_command(text: str):
         await send_text("Commands: `!list` · `!status` · `!remove <keyword>` · `!clear` · `!help`")
         return
 
+    # Plain text → add as keyword
     kw = text
     if kw.lower() in [k.lower() for k in keywords]:
         await send_text(f"**{kw}** is already in the watchlist.")
@@ -274,7 +365,6 @@ async def handle_command(text: str):
 
     keywords.append(kw)
     save_json(KEYWORDS_FILE, keywords)
-    await update_presence()
     await send_text(
         f"✅ Added **{kw}**. Watching {len(keywords)} keyword(s).\n"
         f"🔍 Scanning the full channel history for **{kw}**..."
@@ -298,18 +388,17 @@ async def check_history_for_keyword(kw: str):
                 if kw.lower() in msg.content.lower():
                     found_any = True
                     available_games[kw] = time.time()
-                    await update_presence()
 
-                    server = msg.guild.name if msg.guild else "Unknown"
+                    server  = msg.guild.name if msg.guild else "Unknown"
                     ch_name = getattr(channel, "name", str(channel_id))
                     await send_embed(
                         title="⚠️ Already Available! — Found in Channel History",
                         description=msg.content[:2000],
                         color=0xFEE75C,
                         fields=[
-                            {"name": "Keyword", "value": f"**{kw}**", "inline": True},
-                            {"name": "Server", "value": server, "inline": True},
-                            {"name": "Channel", "value": f"#{ch_name}", "inline": True},
+                            {"name": "Keyword",   "value": f"**{kw}**",  "inline": True},
+                            {"name": "Server",    "value": server,        "inline": True},
+                            {"name": "Channel",   "value": f"#{ch_name}", "inline": True},
                             {"name": "Posted by", "value": str(msg.author), "inline": True},
                             {"name": "Posted at", "value": f"<t:{int(msg.created_at.timestamp())}:R>", "inline": True},
                             {"name": "Jump Link", "value": f"[Go to message]({msg.jump_url})", "inline": False},
@@ -317,7 +406,7 @@ async def check_history_for_keyword(kw: str):
                         footer="This message was already in the channel before you added the keyword.",
                         url=msg.jump_url,
                     )
-                    print(f"History match: '{kw}' in #{ch_name}")
+                    print(f"[HISTORY] '{kw}' in #{ch_name}")
                     break
         except Exception as e:
             print(f"Error reading history for {channel_id}: {e}")
@@ -328,59 +417,17 @@ async def check_history_for_keyword(kw: str):
         )
 
 
-async def poll_commands():
-    """Poll the DM channel every 2s using the bot token to catch commands the user sends."""
-    await asyncio.sleep(8)  # Give on_ready time to finish
-    last_id: str | None = None
-
-    # Seed last_id so we don't re-process old messages on startup
-    channel_id = await ensure_dm_channel()
-    if channel_id:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(
-                f"{DISCORD_API}/channels/{channel_id}/messages",
-                headers={"Authorization": f"Bot {BOT_TOKEN}"},
-                params={"limit": 1},
-            ) as r:
-                if r.status == 200:
-                    msgs = await r.json()
-                    if msgs:
-                        last_id = msgs[0]["id"]
-        print(f"[POLL] Starting command poll. Last seen message: {last_id}")
-
-    while True:
-        try:
-            channel_id = await ensure_dm_channel()
-            if channel_id:
-                params: dict = {"limit": 10}
-                if last_id:
-                    params["after"] = last_id
-
-                async with aiohttp.ClientSession() as s:
-                    async with s.get(
-                        f"{DISCORD_API}/channels/{channel_id}/messages",
-                        headers={"Authorization": f"Bot {BOT_TOKEN}"},
-                        params=params,
-                    ) as r:
-                        if r.status == 200:
-                            msgs = await r.json()
-                            # Messages come newest-first; reverse to process oldest first
-                            for msg in reversed(msgs):
-                                if msg["author"]["id"] == str(USER_ID):
-                                    last_id = msg["id"]
-                                    content = msg["content"].strip()
-                                    print(f"[CMD] Received: {content!r}")
-                                    await handle_command(content)
-        except Exception as exc:
-            print(f"[POLL] Error: {exc}")
-
-        await asyncio.sleep(2)
-
+# ─────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────
 
 def run_bot():
+    bot_gw = BotGateway()
+
     async def _main():
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(client.start(USER_TOKEN))
-            tg.create_task(poll_commands())
+        await asyncio.gather(
+            client.start(USER_TOKEN),
+            bot_gw.run(),
+        )
 
     asyncio.run(_main())
