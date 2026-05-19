@@ -139,34 +139,35 @@ async def update_presence():
 # ─────────────────────────────────────────────
 
 client = discord.Client()
+_welcomed = False
 
 
 @client.event
 async def on_ready():
+    global _welcomed
     print(f"[CLIENT] Logged in as {client.user}")
     await ensure_dm_channel()
 
-    kw_text = (
-        "Currently watching for:\n" + "\n".join(f"• {kw}" for kw in keywords)
-        if keywords
-        else "No keywords yet — DM me any game name to start watching."
-    )
-    await send_embed(
-        title="✅ Bot is online!",
-        description=f"{kw_text}\n\n**Commands:** `!list` · `!status` · `!remove <kw>` · `!clear` · `!help`",
-        color=0x57F287,
-    )
+    if not _welcomed:
+        _welcomed = True
+        kw_text = (
+            "Currently watching for:\n" + "\n".join(f"• {kw}" for kw in keywords)
+            if keywords
+            else "No keywords yet — DM me any game name to start watching."
+        )
+        await send_embed(
+            title="✅ Bot is online!",
+            description=f"{kw_text}\n\n**Commands:** `!list` · `!status` · `!remove <kw>` · `!clear` · `!help`",
+            color=0x57F287,
+        )
 
 
 @client.event
 async def on_message(message: discord.Message):
     # Command: user sends a message in the DM with the bot
-    if (
-        isinstance(message.channel, discord.DMChannel)
-        and message.author.id == USER_ID
-        and message.channel.recipient
-        and message.channel.recipient.id == BOT_ID
-    ):
+    # Check if it's a DM where the user (not the bot) is the author
+    if isinstance(message.channel, discord.DMChannel) and message.author.id == USER_ID:
+        print(f"[CMD] Received: {message.content!r}")
         await handle_command(message.content.strip())
         return
 
