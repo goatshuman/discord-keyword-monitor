@@ -386,6 +386,12 @@ async def on_message(message: discord.Message):
     )
     print(f"[ALERT] {matched} in #{ch_name}")
 
+    # Auto-remove found keywords from watchlist
+    for kw in matched:
+        keywords[:] = [k for k in keywords if k.lower() != kw.lower()]
+    save_json(KEYWORDS_FILE, keywords)
+    await push_presence()
+
 
 # ─────────────────────────────────────────────
 # Command handling
@@ -566,6 +572,10 @@ async def check_history_for_keyword(kw: str):
                         url=msg.jump_url,
                     )
                     print(f"[HISTORY] '{kw}' found in #{ch_name}")
+                    # Auto-remove from watchlist now that it's been found
+                    keywords[:] = [k for k in keywords if k.lower() != kw.lower()]
+                    save_json(KEYWORDS_FILE, keywords)
+                    await push_presence()
                     break
         except Exception as e:
             print(f"Error reading history for {channel_id}: {e}")
