@@ -48,6 +48,7 @@ def save_json(path, data):
 keywords: list[str]               = load_json(KEYWORDS_FILE, [])
 dm_channel_id: str | None         = load_json(DM_CHANNEL_FILE, {}).get("channel_id")
 available_games: dict[str, float] = {}
+alerted_message_ids: set[int]     = set()  # prevents double-alerting on message edits
 
 
 # ─────────────────────────────────────────────
@@ -385,8 +386,60 @@ async def on_message(message: discord.Message):
         url=message.jump_url,
     )
     print(f"[ALERT] {matched} in #{ch_name}")
+    alerted_message_ids.add(message.id)
 
     # Auto-remove found keywords from watchlist
+    for kw in matched:
+        keywords[:] = [k for k in keywords if k.lower() != kw.lower()]
+    save_json(KEYWORDS_FILE, keywords)
+    await push_presence()
+
+
+@client.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    """Catch messages that gain embed data after posting (Discord URL-unfurl / bot edits)."""
+    if after.channel.id not in MONITOR_CHANNELS:
+        return
+    if not keywords:
+        return
+    if after.id in alerted_message_ids:
+        return  # already alerted on this message
+
+    # Only act if embeds were added/changed in the edit
+    if len(after.embeds) <= len(before.embeds):
+        return
+
+    full_text = extract_text(after).lower()
+    matched = [kw for kw in keywords if kw.lower() in full_text]
+    if not matched:
+        return
+
+    for kw in matched:
+        available_games[kw] = time.time()
+
+    active_names = ", ".join(f"🟢 {kw.upper()}" for kw in matched)
+    await push_presence(status="online", activity_name=f"{active_names} — AVAILABLE!", activity_type=0)
+
+    server  = after.guild.name if after.guild else "Unknown"
+    ch_name = getattr(after.channel, "name", str(after.channel.id))
+    summary = message_summary(after)
+
+    await send_embed(
+        title="🚨 Game Alert — Now Available!",
+        description=summary,
+        color=0x57F287,
+        fields=[
+            {"name": "Keywords",  "value": ", ".join(f"**{kw}**" for kw in matched), "inline": False},
+            {"name": "Server",    "value": server,            "inline": True},
+            {"name": "Channel",   "value": f"#{ch_name}",     "inline": True},
+            {"name": "Posted by", "value": str(after.author), "inline": True},
+            {"name": "Jump Link", "value": f"[Go to message]({after.jump_url})", "inline": False},
+        ],
+        url=after.jump_url,
+    )
+    print(f"[ALERT via edit] {matched} in #{ch_name}")
+    alerted_message_ids.add(after.id)
+
     for kw in matched:
         keywords[:] = [k for k in keywords if k.lower() != kw.lower()]
     save_json(KEYWORDS_FILE, keywords)
