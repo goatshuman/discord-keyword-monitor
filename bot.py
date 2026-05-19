@@ -164,13 +164,6 @@ async def on_ready():
 
 @client.event
 async def on_message(message: discord.Message):
-    # Command: user sends a message in the DM with the bot
-    # Check if it's a DM where the user (not the bot) is the author
-    if isinstance(message.channel, discord.DMChannel) and message.author.id == USER_ID:
-        print(f"[CMD] Received: {message.content!r}")
-        await handle_command(message.content.strip())
-        return
-
     # Alert: message in a monitored channel
     if message.channel.id not in MONITOR_CHANNELS:
         return
@@ -335,5 +328,59 @@ async def check_history_for_keyword(kw: str):
         )
 
 
+async def poll_commands():
+    """Poll the DM channel every 2s using the bot token to catch commands the user sends."""
+    await asyncio.sleep(8)  # Give on_ready time to finish
+    last_id: str | None = None
+
+    # Seed last_id so we don't re-process old messages on startup
+    channel_id = await ensure_dm_channel()
+    if channel_id:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                f"{DISCORD_API}/channels/{channel_id}/messages",
+                headers={"Authorization": f"Bot {BOT_TOKEN}"},
+                params={"limit": 1},
+            ) as r:
+                if r.status == 200:
+                    msgs = await r.json()
+                    if msgs:
+                        last_id = msgs[0]["id"]
+        print(f"[POLL] Starting command poll. Last seen message: {last_id}")
+
+    while True:
+        try:
+            channel_id = await ensure_dm_channel()
+            if channel_id:
+                params: dict = {"limit": 10}
+                if last_id:
+                    params["after"] = last_id
+
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(
+                        f"{DISCORD_API}/channels/{channel_id}/messages",
+                        headers={"Authorization": f"Bot {BOT_TOKEN}"},
+                        params=params,
+                    ) as r:
+                        if r.status == 200:
+                            msgs = await r.json()
+                            # Messages come newest-first; reverse to process oldest first
+                            for msg in reversed(msgs):
+                                if msg["author"]["id"] == str(USER_ID):
+                                    last_id = msg["id"]
+                                    content = msg["content"].strip()
+                                    print(f"[CMD] Received: {content!r}")
+                                    await handle_command(content)
+        except Exception as exc:
+            print(f"[POLL] Error: {exc}")
+
+        await asyncio.sleep(2)
+
+
 def run_bot():
-    client.run(USER_TOKEN)
+    async def _main():
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(client.start(USER_TOKEN))
+            tg.create_task(poll_commands())
+
+    asyncio.run(_main())
