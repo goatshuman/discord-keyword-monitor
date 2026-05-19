@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import time
+import base64
 import aiohttp
 import discord
 from dotenv import load_dotenv
@@ -10,7 +11,6 @@ load_dotenv()
 
 BOT_TOKEN  = os.environ["DISCORD_BOT_TOKEN"]
 USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
-USER_ID    = int(os.environ["DISCORD_USER_ID"])
 BOT_ID     = 1505161323091198094
 MONITOR_CHANNELS = [
     int(c.strip())
@@ -30,6 +30,25 @@ BOT_INTENTS = (1 << 12)
 bot_gw: "BotGateway | None" = None
 
 
+def _decode_user_id_from_token(token: str) -> int:
+    """
+    Decode the Discord user ID from the token's first segment.
+    Discord tokens are structured as: base64(user_id).timestamp.hmac
+    This is always correct regardless of what DISCORD_USER_ID is set to.
+    """
+    try:
+        part = token.split(".")[0]
+        part += "=" * (-len(part) % 4)  # fix base64 padding
+        return int(base64.b64decode(part).decode())
+    except Exception as exc:
+        raise RuntimeError(f"Cannot decode USER_ID from USER_TOKEN: {exc}")
+
+
+# Always derive USER_ID from the token itself — never trust a manually-entered env var
+USER_ID = _decode_user_id_from_token(USER_TOKEN)
+print(f"[INIT] USER_ID auto-detected from token: {USER_ID}")
+
+
 def load_json(path, default):
     if os.path.exists(path):
         try:
@@ -41,8 +60,11 @@ def load_json(path, default):
 
 
 def save_json(path, data):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as exc:
+        print(f"[WARN] Could not save {path}: {exc}")
 
 
 keywords: list[str]               = load_json(KEYWORDS_FILE, [])
